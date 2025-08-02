@@ -27,7 +27,7 @@ Servo slots_angle;  //Parking Gate
 #define Slot_3 2
 
 #include <SoftwareSerial.h>  //Bluetooth
-SoftwareSerial bluetooth(0, 1);
+SoftwareSerial bluetooth(10, 11); // Changed from pins 0,1 to avoid conflict with hardware serial
 
 int Parking_sensor_reading=1;
 int current_slot;
@@ -42,6 +42,23 @@ int wait_for_sensor2=0;
 int stop=0;
 int open_time=0;
 int calc_time=0;
+
+// Debouncing variables
+unsigned long lastSensor1Time = 0;
+unsigned long lastSensor2Time = 0;
+unsigned long lastParkingTime = 0;
+const unsigned long debounceDelay = 50; // 50ms debounce
+
+// LCD update variables
+int lastFreeSpace = -1;
+int lastSlots[3] = {-1, -1, -1};
+unsigned long lastLCDUpdate = 0;
+const unsigned long lcdUpdateInterval = 500; // Update LCD every 500ms
+
+// Fire system variables
+bool fireDetected = false;
+unsigned long fireBlinkTime = 0;
+bool fireBlinkState = false;
 
 void setup()
 {
@@ -71,6 +88,51 @@ void setup()
   delay(1500);
 }
 
+// Debounced digital read function
+bool debouncedDigitalRead(int pin, unsigned long &lastTime) {
+  bool reading = digitalRead(pin);
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastTime > debounceDelay) {
+    lastTime = currentTime;
+    return reading;
+  }
+  return HIGH; // Return HIGH (no detection) if within debounce period
+}
+
+// Efficient LCD update function
+void updateLCDDisplay() {
+  unsigned long currentTime = millis();
+  
+  // Only update LCD if enough time has passed or values have changed
+  if (currentTime - lastLCDUpdate >= lcdUpdateInterval || 
+      Free_space != lastFreeSpace || 
+      Slots[0] != lastSlots[0] || 
+      Slots[1] != lastSlots[1] || 
+      Slots[2] != lastSlots[2]) {
+    
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Empty Slots:");
+    lcd.setCursor(13,0);
+    lcd.print(Free_space);
+    lcd.setCursor(0,1);
+    lcd.print(" S1:");
+    lcd.print(Slots[0]);
+    lcd.print(" S2:");
+    lcd.print(Slots[1]);
+    lcd.print(" S3:");
+    lcd.print(Slots[2]);
+    
+    // Update last values
+    lastFreeSpace = Free_space;
+    lastSlots[0] = Slots[0];
+    lastSlots[1] = Slots[1];
+    lastSlots[2] = Slots[2];
+    lastLCDUpdate = currentTime;
+  }
+}
+
 void loop()
 {
 
@@ -78,26 +140,14 @@ void loop()
 //                         Display System
 //====================================================================
 
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Empty Slots:");
-  lcd.setCursor(13,0);
-  lcd.print(Free_space);
-  lcd.setCursor(0,1);
-  lcd.print(" S1:");
-  lcd.print(Slots[0]);
-  lcd.print(" S2:");
-  lcd.print(Slots[1]);
-  lcd.print(" S3:");
-  lcd.print(Slots[2]);
-  lcd.print("                   .");
+  updateLCDDisplay();
 
 //====================================================================
 //                         Gate System
 //====================================================================
 
- sensor1_reading = digitalRead(sensor1);
- sensor2_reading= digitalRead(sensor2);
+ sensor1_reading = debouncedDigitalRead(sensor1, lastSensor1Time);
+ sensor2_reading = debouncedDigitalRead(sensor2, lastSensor2Time);
 
 
   if(sensor1_reading==0 && stop==0 && Free_space > 0)
@@ -163,7 +213,7 @@ void loop()
     }
   }
 
-    if(calc_time == open_time + 3000 ){
+    if(open_time > 0 && calc_time >= open_time + 3000 ){
       wait_for_sensor1=0;
       wait_for_sensor2=0;
       stop=0;
@@ -174,6 +224,7 @@ void loop()
       } 
       Serial.print(" ");
       Serial.println(calc_time);
+      open_time=0; // Reset to prevent repeated execution
     }
 
   if(Free_space > 3){
@@ -202,7 +253,7 @@ void loop()
 //                         Parking System
 //====================================================================
 
-  Parking_sensor_reading = digitalRead(Parking_sensor);
+  Parking_sensor_reading = debouncedDigitalRead(Parking_sensor, lastParkingTime);
 
   // Auto Slot Changer (In Case the current slot is used)
 
@@ -469,39 +520,49 @@ void loop()
 
   if(Flame_sensor_reading < 200)
   {
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.print("Fire alert");
-    digitalWrite(Buzzer,HIGH);
-    digitalWrite(Red_led,HIGH);
-    for(int y=0;y<=90;y=y+5)
-      {  
-      angle.write(y);
-      delay(100);
-      }
-    while(Flame_sensor_reading < 200)
-    {
-      Flame_sensor_reading = analogRead(Flame_sensor);
+    if (!fireDetected) {
+      // Fire just detected
+      fireDetected = true;
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("Fire alert");
       digitalWrite(Buzzer,HIGH);
-      angle.write(90);
-      digitalWrite(Red_led,HIGH);
-      lcd.setCursor(11,0);
-      lcd.print("!");
-      delay(500);
-      digitalWrite(Red_led,LOW);
-      lcd.setCursor(11,0);
-      lcd.print(" ");
-      delay(500);
-    }
-    if (Flame_sensor_reading > 200){
-        digitalWrite(Buzzer,LOW);
-        digitalWrite(Red_led,LOW);
-      for(int y=90;y>=0;y=y-5)
-        {
-        angle.write(y); 
+      
+      // Open gate gradually (non-blocking)
+      for(int y=0;y<=90;y=y+5)
+      {  
+        angle.write(y);
         delay(100);
-        } 
-        lcd.clear();
+      }
+      fireBlinkTime = millis();
+      fireBlinkState = true;
     }
+    
+    // Non-blocking fire alert blinking
+    if (millis() - fireBlinkTime >= 500) {
+      fireBlinkState = !fireBlinkState;
+      digitalWrite(Red_led, fireBlinkState ? HIGH : LOW);
+      lcd.setCursor(11,0);
+      lcd.print(fireBlinkState ? "!" : " ");
+      fireBlinkTime = millis();
+    }
+    
+    digitalWrite(Buzzer,HIGH);
+    angle.write(90);
+  }
+  else if (fireDetected && Flame_sensor_reading >= 200)
+  {
+    // Fire cleared
+    fireDetected = false;
+    digitalWrite(Buzzer,LOW);
+    digitalWrite(Red_led,LOW);
+    
+    // Close gate gradually
+    for(int y=90;y>=0;y=y-5)
+    {
+      angle.write(y); 
+      delay(100);
+    } 
+    lcd.clear();
   }
 }
